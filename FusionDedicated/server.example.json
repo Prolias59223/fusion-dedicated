@@ -47,6 +47,7 @@
   "AntiSpamExemptLevel": "Owner",
 
   "MaxEntities": 2000,
+  "MaxRelayKBPerSecond": 512,
   "CullOrphanedEntities": true,
   "OrphanTimeoutSeconds": 120,
   "BlacklistedBarcodes": [],

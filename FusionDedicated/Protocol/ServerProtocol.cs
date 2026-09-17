@@ -31,6 +31,65 @@ public static class ServerProtocol
         Dictionary<string, string> Metadata,
         List<string> EquippedItems);
 
+    // Join requests are small: an identity, a version, a barcode, the fixed 420-byte
+    // stats block, a handful of metadata keys and the equipped list. The limits are
+    // set an order of magnitude above anything a real client produces, because
+    // whatever the server accepts here it stores and then rebroadcasts to every
+    // player — on join, and again to each future joiner as catch-up.
+    public const int MaxConnectionRequestBytes = 64 * 1024;
+    public const int MaxMetadataEntries = 128;
+    public const int MaxMetadataStringLength = 1024;
+    public const int MaxEquippedItems = 256;
+    public const int MaxBarcodeLength = 256;
+
+    /// <summary>
+    /// Whether a parsed ConnectionRequest is within the limits above. Oversized
+    /// requests are refused rather than trimmed: a client that sends them is broken
+    /// or hostile, and trimming would still put most of the payload in front of
+    /// every player.
+    /// </summary>
+    public static bool ConnectionRequestWithinLimits(ConnectionRequest request, int messageBytes)
+    {
+        if (messageBytes > MaxConnectionRequestBytes)
+        {
+            return false;
+        }
+
+        if (request.Metadata.Count > MaxMetadataEntries ||
+            request.EquippedItems.Count > MaxEquippedItems ||
+            request.AvatarBarcode.Length > MaxBarcodeLength)
+        {
+            return false;
+        }
+
+        foreach (var (key, value) in request.Metadata)
+        {
+            if (key.Length > MaxMetadataStringLength || value.Length > MaxMetadataStringLength)
+            {
+                return false;
+            }
+        }
+
+        return request.EquippedItems.TrueForAll(item => item.Length <= MaxBarcodeLength);
+    }
+
+    /// <summary>
+    /// Why the Privacy setting keeps this player out, or null when it lets them in.
+    /// Steam lobby types: 0 public and 1 private are joinable by anyone who finds the
+    /// server; 2 admits only the server account's Steam friends; 3 (locked) admits
+    /// nobody new.
+    /// </summary>
+    public static string? PrivacyRefusal(int privacy, ulong platformId, Func<ulong, bool> isFriend)
+        => privacy switch
+        {
+            0 or 1 => null,
+            2 => isFriend(platformId)
+                ? null
+                : "Privacy is Friends only and their account is not a friend of the server's",
+            3 => "Privacy is Locked, which admits nobody",
+            _ => $"Privacy is {privacy}, which admits nobody",
+        };
+
     /// <summary>
     /// Parses a client's ConnectionRequest. Layout mirrors ConnectionRequestData:
     /// ulong, Version(3 ints), barcode, 420 bytes of avatar stats, metadata, equipped.
@@ -207,6 +266,42 @@ public static class ServerProtocol
         message.WriteBlock(payload.ToArray());
 
         return message.ToArray();
+    }
+
+    /// <summary>
+    /// Reads a PlayerMetadataResponse a client sent. The server emits this same tag
+    /// itself to push rank changes, so a client-sent one must be inspected before it
+    /// is relayed — whoever controls it controls what every client believes about
+    /// every player's metadata.
+    /// </summary>
+    public static (byte Target, string Key, string Value)? TryReadPlayerMetadataResponse(
+        ReadOnlySpan<byte> message)
+    {
+        try
+        {
+            var reader = new FusionNetReader(message);
+
+            if (reader.ReadByte() != TagPlayerMetadataResponse)
+            {
+                return null;
+            }
+
+            byte relayType = reader.ReadByte();
+            reader.ReadByte(); // channel
+
+            if (relayType != RelayTypeNone)
+            {
+                reader.ReadNullableByte(); // sender
+            }
+
+            reader.ReadInt32(); // payload length
+
+            return (reader.ReadByte(), reader.ReadString() ?? "", reader.ReadString() ?? "");
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>

@@ -181,6 +181,14 @@ public sealed class ServerConfig
     public int MaxEntities { get; set; } = 2000;
 
     /// <summary>
+    /// How much traffic one player may push into the relay each second, kilobytes.
+    /// The relay multiplies whatever a client sends out to everyone else, so an
+    /// uncapped hostile connection saturates the whole lobby at once. The default
+    /// is far above what legitimate play produces; 0 disables the cap.
+    /// </summary>
+    public int MaxRelayKBPerSecond { get; set; } = 512;
+
+    /// <summary>
     /// A dedicated server simulates nothing, so entities whose owner left have no one
     /// applying gravity to them — they hang in place. Culling keeps the world tidy.
     /// </summary>
@@ -399,8 +407,25 @@ public sealed class ServerConfig
             config = JsonSerializer.Deserialize<ServerConfig>(File.ReadAllText(path), Options)
                      ?? new ServerConfig();
         }
-        catch
+        catch (Exception ex)
         {
+            // A torn write after a crash must not cost the operator their ban list.
+            // Park the unreadable file out of the way; the next Save then starts
+            // fresh instead of silently overwriting the only copy.
+            string backup = $"{path}.corrupt-{DateTime.UtcNow:yyyyMMdd-HHmmss}";
+
+            try
+            {
+                File.Copy(path, backup);
+                Console.WriteLine($"server.json could not be read ({ex.Message}). " +
+                                  $"A copy was saved to {backup}; defaults will be used.");
+            }
+            catch
+            {
+                Console.WriteLine($"server.json could not be read ({ex.Message}). " +
+                                  "It was left untouched; defaults will be used.");
+            }
+
             return new ServerConfig();
         }
 

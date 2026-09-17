@@ -397,6 +397,7 @@ gitignored.
 | `LevelBarcode` / `LevelTitle` | the map clients are told to load |
 | `LevelModId` | mod.io ID of the current map; also supplies the server's picture in the browser |
 | `MaxEntities` | world-wide prop ceiling |
+| `MaxRelayKBPerSecond` | how much one player may push into the relay each second; 0 disables |
 | `InheritedTimeoutSeconds` | how long an abandoned prop survives before cleanup |
 | `AntiSpamExemptLevel` | rank that bypasses the spawn guard (`Owner` by default) |
 | `DashboardHost` | `localhost` or `+` — see the warning above |

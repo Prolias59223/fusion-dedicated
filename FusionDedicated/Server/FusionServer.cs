@@ -25,6 +25,7 @@ public sealed class FusionServer : IDisposable
     public DateTime StartedAt { get; } = DateTime.UtcNow;
 
     public SpawnGuard Guard { get; }
+    public RelayBudget RelayBudgets { get; }
     public ResourceMonitor Resources { get; } = new();
 
     public long PacketsIn { get; private set; }
@@ -44,6 +45,7 @@ public sealed class FusionServer : IDisposable
         Config = config;
         Players.MaxPlayers = config.MaxPlayers;
         Guard = new SpawnGuard(config);
+        RelayBudgets = new RelayBudget(config.MaxRelayKBPerSecond);
     }
 
     public void Start()
@@ -200,6 +202,7 @@ public sealed class FusionServer : IDisposable
         NoteDeparture(player.DisplayName, reason);
 
         Guard.Forget(player.SmallId);
+        RelayBudgets.Forget(player.SmallId);
 
         // Their entities lost the only machine simulating them. Hand them to another
         // player if anyone is left, otherwise they hang frozen until culled.
@@ -245,6 +248,27 @@ public sealed class FusionServer : IDisposable
 
     /// <summary>Recent departures, used to spot a whole lobby emptying at once.</summary>
     private readonly List<(DateTime At, string Who, string Reason)> _departures = new();
+
+    /// <summary>
+    /// Abuse warnings repeat every packet by nature, and a wall of identical log
+    /// lines hides everything around them. Each key may speak once a minute.
+    /// </summary>
+    private readonly Dictionary<string, DateTime> _lastWarned = new();
+
+    private void WarnOncePerMinute(string key, string message)
+    {
+        lock (_logLock)
+        {
+            if (_lastWarned.TryGetValue(key, out var last) && DateTime.UtcNow - last < TimeSpan.FromMinutes(1))
+            {
+                return;
+            }
+
+            _lastWarned[key] = DateTime.UtcNow;
+        }
+
+        Log("WARN", message);
+    }
 
     /// <summary>
     /// Players leaving one by one is ordinary. Several going within a few seconds of
@@ -303,33 +327,53 @@ public sealed class FusionServer : IDisposable
 
     private readonly IntPtr[] _messageBuffer = new IntPtr[128];
 
+    /// <summary>
+    /// A burst must be drained in the tick it arrives, not dosed out one batch per
+    /// frame: the transport keeps queueing whatever the loop has not read, and a
+    /// client that out-sends the drain rate grows that queue without limit. The
+    /// per-tick cap only exists so a sustained flood cannot pin the CPU either.
+    /// </summary>
+    private const int MaxReceiveBatchesPerTick = 16;
+
     public void Receive()
     {
-        int count = SteamNetworkingSockets.ReceiveMessagesOnPollGroup(_pollGroup, _messageBuffer, _messageBuffer.Length);
-
-        for (var i = 0; i < count; i++)
+        for (var batch = 0; batch < MaxReceiveBatchesPerTick; batch++)
         {
-            try
+            int count = SteamNetworkingSockets.ReceiveMessagesOnPollGroup(
+                _pollGroup, _messageBuffer, _messageBuffer.Length);
+
+            for (var i = 0; i < count; i++)
             {
-                var native = Marshal.PtrToStructure<SteamNetworkingMessage_t>(_messageBuffer[i]);
+                try
+                {
+                    var native = Marshal.PtrToStructure<SteamNetworkingMessage_t>(_messageBuffer[i]);
 
-                var bytes = new byte[native.m_cbSize];
-                Marshal.Copy(native.m_pData, bytes, 0, native.m_cbSize);
+                    var bytes = new byte[native.m_cbSize];
+                    Marshal.Copy(native.m_pData, bytes, 0, native.m_cbSize);
 
-                PacketsIn++;
-                BytesIn += bytes.Length;
+                    PacketsIn++;
+                    BytesIn += bytes.Length;
 
-                HandleMessage(native.m_conn, bytes);
+                    HandleMessage(native.m_conn, bytes);
+                }
+                catch (Exception ex)
+                {
+                    Log("ERROR", $"Failed to handle a packet: {ex.Message}");
+                }
+                finally
+                {
+                    SteamNetworkingMessage_t.Release(_messageBuffer[i]);
+                }
             }
-            catch (Exception ex)
+
+            if (count < _messageBuffer.Length)
             {
-                Log("ERROR", $"Failed to handle a packet: {ex.Message}");
-            }
-            finally
-            {
-                SteamNetworkingMessage_t.Release(_messageBuffer[i]);
+                return;
             }
         }
+
+        WarnOncePerMinute("receive-flood",
+            "Receive queue is still full after 16 batches — a client is sending faster than the server drains");
     }
 
     private void HandleMessage(HSteamNetConnection connection, byte[] message)
@@ -391,6 +435,10 @@ public sealed class FusionServer : IDisposable
                 HandlePermissionCommand(sender, message);
                 return;
 
+            case ServerProtocol.TagPlayerMetadataResponse when sender != null:
+                HandlePlayerMetadataResponse(sender, message);
+                return;
+
             case FusionProtocol.TagEntityPoseUpdate when sender != null:
                 TrackEntityPose(message);
                 break;
@@ -424,10 +472,18 @@ public sealed class FusionServer : IDisposable
             platformId = info.m_identityRemote.GetSteamID64();
         }
 
-        void Reject(string reason)
+        // The client sees Fusion's own vague wording; the log can name the truth.
+        void Reject(string reason, string? logged = null)
         {
-            Log("WARN", $"Rejected {platformId}: {reason}");
+            Log("WARN", $"Rejected {platformId}: {logged ?? reason}");
             SendTo(connection, ServerProtocol.WriteDisconnect(platformId, reason), reliable: true);
+
+            // The refusal message needs a moment to go out, then the transport
+            // connection has to go too. Left open, a script hammering the join path
+            // would litter the poll group with dead sockets until the transport's
+            // own timeout got round to them.
+            Task.Delay(250).ContinueWith(_ =>
+                SteamNetworkingSockets.CloseConnection(connection, 0, reason, false));
         }
 
         if (Players.Contains(platformId))
@@ -445,6 +501,20 @@ public sealed class FusionServer : IDisposable
         if (Config.FindBan(platformId) is { } ban)
         {
             Reject(ban.Reason);
+            return;
+        }
+
+        if (ServerProtocol.PrivacyRefusal(Config.Privacy, platformId,
+                id => IsFriendOfServer(id)) is { } privacyReason)
+        {
+            // The client is told Fusion's own vague line; the log records the truth.
+            Reject("Server is private.", privacyReason);
+            return;
+        }
+
+        if (!ServerProtocol.ConnectionRequestWithinLimits(request, message.Length))
+        {
+            Reject("Connection request is implausibly large.");
             return;
         }
 
@@ -684,7 +754,7 @@ public sealed class FusionServer : IDisposable
                 }
 
                 Log("WARN", $"{sender.DisplayName} kicked {target.DisplayName}");
-                Kick(target.SmallId, $"Kicked by {target.DisplayName}");
+                Kick(target.SmallId, $"Kicked by {sender.Username}");
                 return;
 
             case ServerProtocol.PermissionCommand.Ban:
@@ -720,6 +790,35 @@ public sealed class FusionServer : IDisposable
     }
 
     /// <summary>
+    /// The server pushes rank changes with this same tag, and clients apply whatever
+    /// arrives against whichever player it names. Relayed unfiltered, any client
+    /// could crown itself Operator in everyone's UI with one message — the server
+    /// would still re-check each command, but every menu would lie. The rank key is
+    /// therefore the server's alone; other metadata keys pass untouched.
+    /// </summary>
+    private void HandlePlayerMetadataResponse(ConnectedPlayer sender, byte[] message)
+    {
+        var parsed = ServerProtocol.TryReadPlayerMetadataResponse(message);
+
+        if (parsed == null)
+        {
+            return;
+        }
+
+        var (target, key, value) = parsed.Value;
+
+        if (string.Equals(key, PermissionMetadataKey, StringComparison.OrdinalIgnoreCase))
+        {
+            WarnOncePerMinute("rank-spoof",
+                $"{sender.DisplayName} tried to set metadata key '{key}' on player {target} " +
+                "— the rank key is server-managed and was dropped");
+            return;
+        }
+
+        Relay(sender, message);
+    }
+
+    /// <summary>
     /// Answers a client that is missing the current level and wants to know which
     /// mod.io mod to fetch. A real host reads this out of its own installed pallets;
     /// a headless server has none, so it repeats what the operator configured.
@@ -727,8 +826,10 @@ public sealed class FusionServer : IDisposable
     /// <summary>Who has been seen using each barcode, so requests can be brokered.</summary>
     private readonly Dictionary<string, HashSet<byte>> _barcodeHolders = new();
 
-    /// <summary>Forwarded requests, so the reply can be matched back to its barcode.</summary>
-    private readonly Dictionary<(byte Requester, uint Tracker), string> _pendingModInfo = new();
+    /// <summary>Forwarded requests, so the reply can be matched back to its barcode —
+    /// and to the holder who was asked, because anyone can *send* a response naming
+    /// a tracker id, and only the holder's answer is worth learning from.</summary>
+    private readonly Dictionary<(byte Requester, uint Tracker), (string Barcode, byte Holder)> _pendingModInfo = new();
 
     private void RememberHolder(string barcode, byte smallId)
     {
@@ -804,7 +905,16 @@ public sealed class FusionServer : IDisposable
                 is { } forwarded &&
             Players.Get(holder.Value) is { } holderPlayer)
         {
-            _pendingModInfo[(sender.SmallId, trackerId)] = barcode;
+            // The catalogue is persisted, so a forged answer would poison every
+            // future joiner's downloads; only the holder we actually asked may
+            // teach it. Trim ancient entries rather than let a lobby of askers
+            // grow the map without bound.
+            if (_pendingModInfo.Count > 4096)
+            {
+                _pendingModInfo.Clear();
+            }
+
+            _pendingModInfo[(sender.SmallId, trackerId)] = (barcode, holder.Value);
 
             SendTo(holderPlayer.Connection, forwarded, reliable: true);
 
@@ -847,16 +957,20 @@ public sealed class FusionServer : IDisposable
     {
         var response = ServerProtocol.TryReadModInfoResponse(message);
 
+        // The holder is checked before the entry is removed, so a forged reply from
+        // anyone else cannot burn the pending request to clear the way.
         if (response is { } r && r.Target.HasValue &&
-            _pendingModInfo.Remove((r.Target.Value, r.TrackerId), out string? barcode) &&
+            _pendingModInfo.TryGetValue((r.Target.Value, r.TrackerId), out var pending) &&
+            sender.SmallId == pending.Holder &&
+            _pendingModInfo.Remove((r.Target.Value, r.TrackerId)) &&
             r.ModId > 0)
         {
-            RememberHolder(barcode, sender.SmallId);
+            RememberHolder(pending.Barcode, sender.SmallId);
 
-            if (Config.LearnMod(barcode, r.ModId, r.ModFileId))
+            if (Config.LearnMod(pending.Barcode, r.ModId, r.ModFileId))
             {
                 Config.Save(Program.ConfigPath);
-                Log("INFO", $"Learned '{barcode}' is mod.io {r.ModId} — the server can serve it from now on");
+                Log("INFO", $"Learned '{pending.Barcode}' is mod.io {r.ModId} — the server can serve it from now on");
             }
         }
 
@@ -1020,6 +1134,24 @@ public sealed class FusionServer : IDisposable
     /// <summary>Steam ID this server runs under; used as the LobbyInfo's lobby ID.</summary>
     public ulong HostPlatformId { get; set; }
 
+    /// <summary>
+    /// Whether a SteamID is a Steam friend of the account the server runs under —
+    /// the gate behind Privacy "Friends only". A headless account usually has no
+    /// friends, and that is the honest answer: nobody joins until it befriends them.
+    /// Fail closed if Steamworks will not answer.
+    /// </summary>
+    private static bool IsFriendOfServer(ulong platformId)
+    {
+        try
+        {
+            return SteamFriends.HasFriend(new CSteamID(platformId), EFriendFlags.k_EFriendFlagImmediate);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public string BuildLobbyInfoJson()
         => LobbyInfoBuilder.Serialize(Config, Players.Players, HostPlatformId);
 
@@ -1044,6 +1176,19 @@ public sealed class FusionServer : IDisposable
         }
 
         var (requestedOwner, entityId) = request.Value;
+
+        // An ownership request is a client claiming a prop for itself — picking up
+        // something unowned, or re-asking for one it already holds. Naming another
+        // connected player is not a claim, it is a frame job: the guard purges and
+        // kicks by owner, so a griefer could hand their flood to an innocent player
+        // and let the server evict them for it. Bytes that name nobody valid still
+        // pass — Fusion uses those to release a prop.
+        if (requestedOwner != sender.SmallId && Players.Get(requestedOwner) != null)
+        {
+            WarnOncePerMinute($"ownership-spoof-{sender.SmallId}",
+                $"{sender.DisplayName} claimed entity {entityId} for player {requestedOwner} — refused");
+            return;
+        }
 
         Entities.SetOwner(entityId, requestedOwner);
 
@@ -1077,6 +1222,20 @@ public sealed class FusionServer : IDisposable
 
     private void Relay(ConnectedPlayer sender, byte[] message)
     {
+        // The relay multiplies: everything forwarded here reaches every other
+        // client. One player's outbound budget bounds how much of that they may
+        // cause — the spawn guard limits spawn counts, this limits raw bytes.
+        if (!RelayBudgets.Allow(sender.SmallId, message.Length))
+        {
+            if (RelayBudgets.LastOverrun is { } overrun)
+            {
+                WarnOncePerMinute("relay-budget",
+                    $"Relay budget: {overrun} — their messages are being dropped");
+            }
+
+            return;
+        }
+
         var (relayType, channel, target) = ServerProtocol.ReadRoute(message);
 
         bool reliable = channel != 1;
